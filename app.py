@@ -19,6 +19,9 @@ import json
 import time
 from typing import Dict, List, Tuple
 import warnings
+import asyncio
+import gc
+import os
 warnings.filterwarnings('ignore')
 
 # Page configuration
@@ -103,6 +106,19 @@ st.markdown("""
         border-radius: 15px;
         border: 1px solid rgba(255, 255, 255, 0.1);
     }
+    
+    /* Mobile optimization */
+    @media (max-width: 768px) {
+        .metric-card {
+            margin: 5px 0;
+            padding: 15px;
+        }
+        
+        .stButton > button {
+            width: 100%;
+            margin: 5px 0;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -116,7 +132,10 @@ if 'causal_model' not in st.session_state:
 if 'sentiment_data' not in st.session_state:
     st.session_state.sentiment_data = None
 
-@st.cache_data
+# Get memory limit for optimization (useful for deployment on Heroku or other platforms)
+MEMORY_LIMIT = int(os.environ.get('MEMORY_LIMIT', '512'))
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
 def load_real_data():
     """Load and preprocess real Uganda election data"""
     # Simulate loading real data - in production, this would read the actual files
@@ -152,6 +171,9 @@ def load_real_data():
         'internet_access': np.random.uniform(0.15, 0.4, size=len(districts))
     })
     
+    # Force garbage collection for memory optimization
+    gc.collect()
+    
     return results_2021, youth_data, economic_data
 
 @st.cache_resource
@@ -179,9 +201,15 @@ def initialize_causal_model():
     
     return CausalModel()
 
+@st.cache_data(max_entries=100 if MEMORY_LIMIT < 1024 else 1000)
 def generate_synthetic_voters(n_voters=10000):
     """Generate synthetic voter profiles using PATE-GAN approach"""
     np.random.seed(42)
+    
+    # Memory-aware data generation
+    if MEMORY_LIMIT < 512 and n_voters > 20000:
+        st.warning(f"Reducing voter count to 20,000 due to memory constraints")
+        n_voters = 20000
     
     # Age distribution (78% under 30)
     ages = np.concatenate([
@@ -218,13 +246,48 @@ def generate_synthetic_voters(n_voters=10000):
     voters_df.loc[voters_df['social_media_user'] == True, 'turnout_probability'] -= 0.05
     voters_df['turnout_probability'] = voters_df['turnout_probability'].clip(0, 1)
     
+    # Force garbage collection
+    gc.collect()
+    
     return voters_df
+
+# Async data loading function
+async def load_data_async():
+    """Asynchronously load multiple data sources"""
+    async def load_election_results():
+        # Simulate async loading
+        await asyncio.sleep(0.1)
+        return load_real_data()[0]
+    
+    async def load_demographic_data():
+        # Simulate async loading
+        await asyncio.sleep(0.1)
+        return load_real_data()[1]
+    
+    async def load_economic_indicators():
+        # Simulate async loading
+        await asyncio.sleep(0.1)
+        return load_real_data()[2]
+    
+    # Parallel data loading
+    results = await asyncio.gather(
+        load_election_results(),
+        load_demographic_data(),
+        load_economic_indicators()
+    )
+    return results
 
 def simulate_multi_agent_voting(voters_df, n_iterations=5):
     """Multi-agent simulation with LLM-style reasoning"""
     # Create social network
     n_voters = len(voters_df)
-    G = nx.barabasi_albert_graph(n_voters, 5)
+    
+    # Memory optimization for large networks
+    if n_voters > 10000:
+        st.info("Using sparse network for large voter population")
+        G = nx.barabasi_albert_graph(n_voters, 3)  # Reduced connections
+    else:
+        G = nx.barabasi_albert_graph(n_voters, 5)
     
     # Initialize voting intentions
     voting_intentions = np.random.choice([0, 1], n_voters, p=[0.6, 0.4])
@@ -256,6 +319,7 @@ def simulate_multi_agent_voting(voters_df, n_iterations=5):
     
     return history, G
 
+@st.cache_data(ttl=600)  # Cache for 10 minutes
 def generate_real_time_sentiment():
     """Simulate real-time social media sentiment analysis"""
     # Generate synthetic sentiment data
@@ -320,8 +384,35 @@ def main():
     st.markdown("<p class='gradient-text' style='font-size: 24px;'>Cutting-Edge AI & Machine Learning for Electoral Insights</p>", 
                 unsafe_allow_html=True)
     
-    # Load data
-    results_2021, youth_data, economic_data = load_real_data()
+    # Add cache management in sidebar
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("### 🔧 System Management")
+        
+        # Cache management
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button('Clear Cache', help="Clear all cached data to free memory"):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                gc.collect()  # Force garbage collection
+                st.success("✅ Cache cleared!")
+        
+        with col2:
+            if st.button('Optimize Memory', help="Run garbage collection"):
+                gc.collect()
+                st.success("✅ Memory optimized!")
+    
+    # Load data with progress indicator
+    with st.spinner("Loading electoral data..."):
+        # Try async loading if available
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            results_2021, youth_data, economic_data = loop.run_until_complete(load_data_async())
+        except:
+            # Fallback to sync loading
+            results_2021, youth_data, economic_data = load_real_data()
     
     # Sidebar
     with st.sidebar:
@@ -341,8 +432,20 @@ def main():
         
         # Advanced settings
         st.markdown("<h3 class='highlight'>Advanced Settings</h3>", unsafe_allow_html=True)
-        n_synthetic_voters = st.slider("Synthetic Voters", 1000, 50000, 10000)
+        
+        # Memory-aware voter count
+        max_voters = 20000 if MEMORY_LIMIT < 512 else 50000
+        n_synthetic_voters = st.slider("Synthetic Voters", 1000, max_voters, 10000)
         enable_privacy = st.checkbox("Enable Differential Privacy", value=True)
+        
+        # Performance settings
+        st.markdown("### ⚡ Performance")
+        enable_caching = st.checkbox("Enable Smart Caching", value=True, 
+                                   help="Cache results for faster performance")
+        batch_size = st.select_slider("Processing Batch Size", 
+                                    options=[100, 500, 1000, 5000],
+                                    value=1000,
+                                    help="Smaller batches use less memory")
         
     # Main content area
     if analysis_type == "🧠 Causal AI & Counterfactuals":
